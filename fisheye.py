@@ -38,6 +38,7 @@ import json
 import numpy as np
 import Tkinter as tk
 import tkFileDialog
+import tkMessageBox
 import sys
 import traceback
 from math import pi
@@ -308,7 +309,7 @@ class PanoramaImage:
             for n in range(len(self.sources)):
                 self.sources[n].add_pixels(uv_list[n], img1d, wt_list[n] / wt_total)
         else:
-            print 'Invalid render method.'
+            raise ValueError('Invalid render method.')
         # Convert to fixed-point image matrix and return.
         img2d = np.reshape(img1d, (rows, cols, self.clrs))
         return np.asarray(img2d, dtype=self.dtype)
@@ -538,11 +539,16 @@ class PanoramaGUI:
         img_frame.pack()
         # Make buttons to load, save, and adjust the lens configuration.
         lens_frame = tk.LabelFrame(frame, text='Lens Configuration and Alignment')
-        tk.Button(lens_frame, text='Lens 1', command=self._adjust_lens1).grid(row=0, column=0, sticky='NESW')
-        tk.Button(lens_frame, text='Lens 2', command=self._adjust_lens2).grid(row=0, column=1, sticky='NESW')
-        tk.Button(lens_frame, text='Align', command=self._adjust_align).grid(row=0, column=2, sticky='NESW')
-        tk.Button(lens_frame, text='Load', command=self._load_config).grid(row=1, column=0, columnspan=2, sticky='NESW')
-        tk.Button(lens_frame, text='Save', command=self._save_config).grid(row=1, column=2, sticky='NESW')
+        btn_lens1 = tk.Button(lens_frame, text='Lens 1', command=self._adjust_lens1)
+        btn_lens2 = tk.Button(lens_frame, text='Lens 2', command=self._adjust_lens2)
+        btn_align = tk.Button(lens_frame, text='Align', command=self._adjust_align)
+        btn_load = tk.Button(lens_frame, text='Load', command=self._load_config)
+        btn_save = tk.Button(lens_frame, text='Save', command=self._save_config)
+        btn_lens1.grid(row=0, column=0, sticky='NESW')
+        btn_lens2.grid(row=0, column=1, sticky='NESW')
+        btn_align.grid(row=0, column=2, sticky='NESW')
+        btn_load.grid(row=1, column=0, columnspan=2, sticky='NESW')
+        btn_save.grid(row=1, column=2, sticky='NESW')
         lens_frame.pack(fill=tk.BOTH)
         # Buttons to render the final output in different modes.
         out_frame = tk.LabelFrame(frame, text='Final output rendering')
@@ -553,6 +559,10 @@ class PanoramaGUI:
         btn_rect.pack(fill=tk.BOTH)
         btn_cube.pack(fill=tk.BOTH)
         out_frame.pack(fill=tk.BOTH)
+        # Status indicator box.
+        self.status = tk.Label(frame, relief=tk.SUNKEN,
+                               text='Select input images to begin.')
+        self.status.pack(fill=tk.BOTH)
         # Finish frame creation.
         frame.pack()
 
@@ -560,21 +570,39 @@ class PanoramaGUI:
     def _adjust_lens1(self):
         if self.win_align is not None:
             self.win_lens1.destroy()
-        self.win_lens1 = tk.Toplevel(self.parent)
-        FisheyeAlignmentGUI(self.win_lens1, self.img1.get(), self.lens1)
+        try:
+            self.win_lens1 = tk.Toplevel(self.parent)
+            FisheyeAlignmentGUI(self.win_lens1, self.img1.get(), self.lens1)
+        except IOError:
+            self.win_lens1.destroy()
+            tkMessageBox.showerror('Error', 'Unable to read image file #1.')
+        except:
+            self.win_lens1.destroy()
+            tkMessageBox.showerror('Dialog creation error', traceback.format_exc())
 
     def _adjust_lens2(self):
         if self.win_align is not None:
             self.win_lens2.destroy()
-        self.win_lens2 = tk.Toplevel(self.parent)
-        FisheyeAlignmentGUI(self.win_lens2, self.img2.get(), self.lens2)
+        try:
+            self.win_lens2 = tk.Toplevel(self.parent)
+            FisheyeAlignmentGUI(self.win_lens2, self.img2.get(), self.lens2)
+        except IOError:
+            self.win_lens1.destroy()
+            tkMessageBox.showerror('Error', 'Unable to read image file #2.')
+        except:
+            self.win_lens2.destroy()
+            tkMessageBox.showerror('Dialog creation error', traceback.format_exc())
 
     def _adjust_align(self):
-        pan = self._create_panorama()
         if self.win_align is not None:
             self.win_align.destroy()
-        self.win_align = tk.Toplevel(self.parent)
-        PanoramaAlignmentGUI(self.win_align, pan)
+        try:
+            pan = self._create_panorama()
+            self.win_align = tk.Toplevel(self.parent)
+            PanoramaAlignmentGUI(self.win_align, pan)
+        except:
+            self.win_align.destroy()
+            tkMessageBox.showerror('Dialog creation error', traceback.format_exc())
 
     # Create panorama object using current settings.
     def _create_panorama(self):
@@ -585,30 +613,43 @@ class PanoramaGUI:
     # Load or save lens configuration and alignment.
     def _load_config(self):
         file_obj = tkFileDialog.askopenfile()
-        if file_obj is not None:
+        if file_obj is None: return
+        try:
             load_config(file_obj, self.lens1, self.lens2)
+        except:
+            tkMessageBox.showerror('Config load error', traceback.format_exc())
+                
 
     def _save_config(self):
         file_obj = tkFileDialog.asksaveasfile()
-        if file_obj is not None:
+        if file_obj is None: return
+        try:
             save_config(file_obj, self.lens1, self.lens2)
+        except:
+            tkMessageBox.showerror('Config save error', traceback.format_exc())
 
     # Render and save output in various modes.
-    def _render_rect(self):
+    def _render_generic(self, render_type, render_size=1024):
+        # Popup asks user for output file.
         file_obj = tkFileDialog.asksaveasfile(mode='wb')
-        if file_obj is not None:
-            print 'Rendering equirectangular image: ' + file_obj.name
+        # Abort if user clicks 'cancel'.
+        if file_obj is None: return
+        # Proceed with rendering...
+        self._set_status('Rendering image: ' + file_obj.name, 'wait')
+        try:
             panorama = self._create_panorama()
-            panorama.render_equirectangular(1024).save(file_obj)
-            print 'Done!'
+            render_func = getattr(panorama, render_type)
+            render_func(render_size).save(file_obj)
+            self._set_status('Done!')
+        except:
+            tkMessageBox.showerror('Render error', traceback.format_exc())
+            self._set_status('Render failed.')
+
+    def _render_rect(self):
+        self._render_generic('render_equirectangular')
 
     def _render_cube(self):
-        file_obj = tkFileDialog.asksaveasfile(mode='wb')
-        if file_obj is not None:
-            print 'Rendering cubemap image: ' + file_obj.name
-            panorama = self._create_panorama()
-            panorama.render_cubemap(1024).save(file_obj)
-            print 'Done!'
+        self._render_generic('render_cubemap')
 
     # Callback to create a file-selection popup.
     def _file_select(self, tkstr):
@@ -632,16 +673,13 @@ class PanoramaGUI:
         button.grid(row=rowidx, column=2)
         return tkstr
 
+    # Set status text, and optionally update cursor.
+    def _set_status(self, status, cursor='arrow'):
+        self.parent.config(cursor=cursor)
+        self.status.configure(text=status)
+
 
 if __name__ == "__main__":
-
-    # Set default configuration.
-    file_img1 = ''  # Source file for image #1
-    file_img2 = ''  # Source file for image #2
-    file_cfg  = ''  # Source file for lens alignment
-    file_cube = ''  # Output file for cubemap render
-    file_rect = ''  # Output file for equirectangular render
-
     # If we have exactly four arguments, run command-line version.
     if len(sys.argv) == 5:
         # First argument is the lens alignment file.
@@ -683,11 +721,6 @@ if __name__ == "__main__":
         sys.exit(2)
 
     # Otherwise, start the interactive GUI.
-    try:
-        root = tk.Tk()
-        PanoramaGUI(root)
-        root.mainloop()
-    except:
-        traceback.print_exc()
-        root.destroy()
-        sys.exit(3)
+    root = tk.Tk()
+    PanoramaGUI(root)
+    root.mainloop()
