@@ -442,9 +442,8 @@ class PanoramaAlignmentGUI:
         axis_chk = tk.Checkbutton(self.controls, variable=self.flip_axis)
         axis_chk.grid(row=1, column=1, columnspan=2, sticky='NESW')
         # Extract the (hopefully small) alignment offset.
-        # TODO: There seems to be a bug in this, likely multiply ordering?
         flip_conj = conj_qq(mul_qq(flip_qq, front_qq))
-        align_qq = conj_qq(mul_qq(back_qq, flip_conj))
+        align_qq = mul_qq(back_qq, flip_conj)
         # Make three sliders for adjusting the relative alignment.
         self.slide_rx = self._make_slider(self.controls, 2, 'Rotate X', front_qq[1])
         self.slide_ry = self._make_slider(self.controls, 3, 'Rotate Y', front_qq[2])
@@ -477,7 +476,7 @@ class PanoramaAlignmentGUI:
         align_qq = norm_qq(self.slide_ax.get(),
                            self.slide_ay.get(),
                            self.slide_az.get())
-        back_qq = mul_qq(mul_qq(flip_qq, front_qq), align_qq)
+        back_qq = mul_qq(align_qq, mul_qq(flip_qq, front_qq))
         self.panorama.sources[0].lens.center_qq = front_qq
         self.panorama.sources[1].lens.center_qq = back_qq
         # Render the preview.
