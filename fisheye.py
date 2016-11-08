@@ -227,7 +227,6 @@ class FisheyeImage:
 
 # A panorama image made from several FisheyeImage sources.
 # TODO: Add support for supersampled anti-aliasing filters.
-# TODO: Split rendering logic into sections, to avoid memory limits.
 class PanoramaImage:
     def __init__(self, src_list):
         self.sources = src_list
@@ -467,7 +466,6 @@ class PanoramaAlignmentGUI:
         # Sanity check that initialization is completed:
         if not self.init_done: return
         # Determine the primary axis of rotation.
-        axis_lbl = self.flip_axis.get()
         if self.flip_axis.get():
             flip_qq = [0,0,0,1]
         else:
