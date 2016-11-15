@@ -102,6 +102,10 @@ class FisheyeLens:
         # Quaternion mapping intended to actual optical axis.
         self.center_qq = [1, 0, 0, 0]
 
+    def downsample(self, dsamp):
+        self.radius_px /= dsamp
+        self.center_px /= dsamp
+
     def get_x(self):
         return np.asscalar(self.center_px[0])
 
@@ -154,6 +158,17 @@ class FisheyeImage:
             self.lens = FisheyeLens(self.rows, self.cols)
         else:
             self.lens = lens
+
+    # Shrink source image and adjust lens accordingly.
+    def downsample(self, dsamp):
+        # Adjust lens parameters.
+        self.lens.downsample(dsamp)
+        # Determine the new image dimensions.
+        shape = self.img.shape[0:2] / dsamp
+        # Convert matrix back to PIL Image, resample, and convert back.
+        img = Image.fromarray(self.img)
+        img.thumbnail(shape, Image.LANCZOS)
+        self.img = np.array(img)
 
     # Given an 3xN array of "XYZ" vectors in panorama space (+X = Front),
     # convert each ray to 2xN coordinates in "UV" fisheye image space.
@@ -233,10 +248,58 @@ class PanoramaImage:
         self.dtype = self.sources[0].img.dtype
         self.clrs = self.sources[0].clrs
 
-    def get_render_methods(self):
+    # Downsample each source image.
+    def downsample(self, dsamp):
+        for src in self.sources:
+            src.downsample(dsamp)
+
+    # Return a list of 'mode' strings suitable for render_xx() methods.
+    def get_render_modes(self):
         return ['overwrite', 'align', 'blend']
 
-    def render_equirectangular(self, out_size, method='blend'):
+    # Using current settings as an initial guess, use an iterative optimizer
+    # to better align the source images.  Adjusts FOV of each lens, as well
+    # as the rotation quaternions for all lenses except the first.
+    # TODO: Implement a higher-order loop that iterates this step with
+    #       progressively higher resolution.  (See also: create_panorama)
+    def optimize(self, wt_overlap):
+        # Precalculate raster-order XYZ coordinates.
+        [xyz, rows, cols] = self._get_equirectangular_raster(256)
+        # Multivariable optimization using gradient-descent or similar.
+        # https://docs.scipy.org/doc/scipy/reference/tutorial/optimize.html
+        # TODO: Implement this!
+
+    # Render combined panorama in equirectangular projection mode.
+    # See also: https://en.wikipedia.org/wiki/Equirectangular_projection
+    def render_equirectangular(self, out_size, mode='blend'):
+        # Render the entire output in a single pass.
+        [xyz, rows, cols] = self._get_equirectangular_raster(out_size)
+        return Image.fromarray(self._render(xyz, rows, cols, mode))
+
+    # Render combined panorama in cubemap projection mode.
+    # See also: https://en.wikipedia.org/wiki/Cube_mapping
+    def render_cubemap(self, out_size, mode='blend'):
+        # Create coordinate arrays.
+        cvec = np.arange(out_size, dtype='float32') - out_size/2        # Coordinate range [-S/2, S/2)
+        vec0 = np.ones(out_size*out_size, dtype='float32') * out_size/2 # Constant vector +S/2
+        vec1 = np.repeat(cvec, out_size)                                # Increment every N steps
+        vec2 = np.tile(cvec, out_size)                                  # Sweep N times
+        # Create XYZ coordinate vectors and render each cubemap face.
+        render = lambda(xyz): self._render(xyz, out_size, out_size, mode)
+        xm = render(np.matrix([-vec0, vec1, vec2]))     # -X face
+        xp = render(np.matrix([vec0, vec1, -vec2]))     # +X face
+        ym = render(np.matrix([-vec1, -vec0, vec2]))    # -Y face
+        yp = render(np.matrix([vec1, vec0, vec2]))      # +Y face
+        zm = render(np.matrix([-vec2, vec1, -vec0]))    # -Z face
+        zp = render(np.matrix([vec2, vec1, vec0]))      # +Z face
+        # Concatenate the individual faces in canonical order:
+        # https://en.wikipedia.org/wiki/Cube_mapping#Memory_Addressing
+        img_mat = np.concatenate([zp, zm, ym, yp, xm, xp], axis=0)
+        return Image.fromarray(img_mat)
+
+    # Get XYZ vectors for an equirectangular render, in raster order.
+    # (Each row left to right, with rows concatenates from top to bottom.)
+    def _get_equirectangular_raster(self, out_size):
         # Set image size (2x1 aspect ratio)
         rows = out_size
         cols = 2*out_size
@@ -253,47 +316,28 @@ class PanoramaImage:
         x = cos_y * cos_x
         y = sin_y * np.ones((1,cols), dtype='float32')
         z = cos_y * sin_x
-        # Vectorize and accumulate source images
+        # Vectorize the coordinates in raster order.
         xyz = np.matrix([x.ravel(), y.ravel(), z.ravel()])
-        # Render the entire output in a single pass.
-        return Image.fromarray(self._render(xyz, rows, cols, method))
+        return [xyz, rows, cols]
 
-    def render_cubemap(self, out_size, method='blend'):
-        # Create coordinate arrays.
-        cvec = np.arange(out_size, dtype='float32') - out_size/2        # Coordinate range [-S/2, S/2)
-        vec0 = np.ones(out_size*out_size, dtype='float32') * out_size/2 # Constant vector +S/2
-        vec1 = np.repeat(cvec, out_size)                                # Increment every N steps
-        vec2 = np.tile(cvec, out_size)                                  # Sweep N times
-        # Create XYZ coordinate vectors and render each cubemap face.
-        render = lambda(xyz): self._render(xyz, out_size, out_size, method)
-        xm = render(np.matrix([-vec0, vec1, vec2]))     # -X face
-        xp = render(np.matrix([vec0, vec1, -vec2]))     # +X face
-        ym = render(np.matrix([-vec1, -vec0, vec2]))    # -Y face
-        yp = render(np.matrix([vec1, vec0, vec2]))      # +Y face
-        zm = render(np.matrix([-vec2, vec1, -vec0]))    # -Z face
-        zp = render(np.matrix([vec2, vec1, vec0]))      # +Z face
-        # Concatenate the individual faces in canonical order:
-        # https://en.wikipedia.org/wiki/Cube_mapping#Memory_Addressing
-        img_mat = np.concatenate([zp, zm, ym, yp, xm, xp], axis=0)
-        return Image.fromarray(img_mat)
-
-    # Add pixels from every source to the given output image.
-    def _render(self, xyz, rows, cols, method):
+    # Add pixels from every source to form a complete output image.
+    # Several blending modes are available. See also: get_render_modes()
+    def _render(self, xyz, rows, cols, mode):
         # Allocate Nx3 or Nx1 "1D" pixel-list (raster-order).
         img1d = np.zeros((rows*cols, self.clrs), dtype='float32')
-        # Determine rendering method:
-        if method == 'overwrite':
-            # Simplest method: Draw first, then blindly overwrite second.
+        # Determine rendering mode:
+        if mode == 'overwrite':
+            # Simplest mode: Draw first, then blindly overwrite second.
             for src in self.sources:
                 uv = src.get_uv(xyz)
                 src.add_pixels(uv, img1d)
-        elif method == 'align':
+        elif mode == 'align':
             # Alignment mode: Draw each one at 50% intensity.
             for src in self.sources:
                 uv = src.get_uv(xyz)
                 src.add_pixels(uv, img1d, 0.5)
-        elif method == 'blend':
-            # Nearest-source blending: Gradual transition in overlap range.
+        elif mode == 'blend':
+            # Linear nearest-source blending.
             uv_list = []
             wt_list = []
             wt_total = np.zeros(rows*cols, dtype='float32')
@@ -306,12 +350,35 @@ class PanoramaImage:
                 wt_total += wt
             # Render overall image using calculated weights.
             for n in range(len(self.sources)):
-                self.sources[n].add_pixels(uv_list[n], img1d, wt_list[n] / wt_total)
+                wt_norm = wt_list[n] / wt_total
+                self.sources[n].add_pixels(uv_list[n], img1d, wt_norm)
         else:
-            raise ValueError('Invalid render method.')
+            raise ValueError('Invalid render mode.')
         # Convert to fixed-point image matrix and return.
         img2d = np.reshape(img1d, (rows, cols, self.clrs))
         return np.asarray(img2d, dtype=self.dtype)
+
+    # Compute a normalized alignment score, based on size of overlap and
+    # the pixel-differences in that region.
+    def _score(self, xyz, wt_overlap):
+        # Determine masks for each input image.
+        uv0 = self.sources[0].get_uv(xyz)
+        uv1 = self.sources[1].get_uv(xyz)
+        wt0 = self.sources[0].get_weight(uv0)
+        wt1 = self.sources[1].get_weight(uv1)
+        # Count overlapping pixels.
+        ovr_mask = np.logical_and(wt0 > 0, wt1 > 0)
+        ct_overlap = np.sum(ovr_mask)
+        # Allocate Nx3 or Nx1 "1D" pixel-list (raster-order).
+        pcount = max(xyz.shape)
+        img1d = np.zeros((pcount, self.clrs), dtype='float32')
+        # Render the difference image, overlapping region only.
+        self.sources[0].add_pixels(uv0, img1d, ovr_mask)
+        self.sources[1].add_pixels(uv1, img1d, -ovr_mask)
+        # Sum-of-square differences.
+        sum_sqd = np.sum(np.sum(np.sum(np.square(img1d))))
+        # Compute overall score.  (Note: Higher = Better)
+        return wt_overlap * ct_overlap - sum_sqd
 
 
 # Tkinter GUI window for loading a fisheye image.
@@ -340,7 +407,7 @@ class FisheyeAlignmentGUI:
         self.preview.bind('<Configure>', self.update_preview)  # Update on resize
         # Finish frame creation.
         self.controls.pack(side=tk.LEFT)
-        self.preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=1)
         self.frame.pack()
         self.update_preview()
 
@@ -412,19 +479,18 @@ class PanoramaAlignmentGUI:
         self.init_done = False
         # Store source and preview size
         self.panorama = panorama
-        self.psize = psize
         # Create frame for this window with two vertical panels...
         parent.wm_title('Panorama Alignment')
         self.frame = tk.Frame(parent)
         self.controls = tk.Frame(self.frame)
         # Make a drop-menu to select the rendering mode.
         tk.Label(self.controls, text='Preview mode').grid(row=0, column=0, sticky=tk.W)
-        self.method = tk.StringVar()
-        self.method.set('align')
-        self.method.trace('w', self.update_preview)
-        method_list = self.panorama.get_render_methods()
-        method_drop = tk.OptionMenu(self.controls, self.method, *method_list)
-        method_drop.grid(row=0, column=1, columnspan=2, sticky='NESW')
+        self.mode = tk.StringVar()
+        self.mode.set('align')
+        self.mode.trace('w', self.update_preview)
+        mode_list = self.panorama.get_render_modes()
+        mode_drop = tk.OptionMenu(self.controls, self.mode, *mode_list)
+        mode_drop.grid(row=0, column=1, columnspan=2, sticky='NESW')
         # Determine which axis marks the main 180 degree rotation.
         front_qq = panorama.sources[0].lens.center_qq
         back_qq  = panorama.sources[1].lens.center_qq
@@ -456,12 +522,14 @@ class PanoramaAlignmentGUI:
         # Add the preview.
         self.preview_lbl = tk.Label(self.frame)
         self.init_done = True
-        self.update_preview()
-        self.preview_lbl.pack()
+        self.update_preview(psize)
+        self.preview_lbl.pack(fill=tk.BOTH, expand=1)
         # Finish frame creation.
-        self.frame.pack()
+        self.frame.pack(fill=tk.BOTH, expand=1)
+        self.frame.bind('<Configure>', self._update_callback)  # Update on resize
 
-    def update_preview(self, *args):
+    # Update the GUI preview using latest alignment parameters.
+    def update_preview(self, psize):
         # Sanity check that initialization is completed:
         if not self.init_done: return
         # Determine the primary axis of rotation.
@@ -483,9 +551,15 @@ class PanoramaAlignmentGUI:
         # Note: The Tk-Label doesn't maintain a reference to the image object.
         #       To avoid garbage-collection, keep one in this class.
         self.preview_img = ImageTk.PhotoImage(
-            self.panorama.render_equirectangular(self.psize, self.method.get()))
+            self.panorama.render_equirectangular(psize, self.mode.get()))
         # Assign the new icon.
         self.preview_lbl.configure(image=self.preview_img)
+
+    # Find the largest output size that fits within the given bounds and
+    # matches the 2:1 aspect ratio of the equirectangular preview.
+    def _get_aspect_size(self, max_size):
+        return (min(max_size[0], max_size[1] / 2),
+                min(max_size[1], max_size[0] * 2))
 
     # Make a combined label/textbox/slider for a given variable:
     def _make_slider(self, parent, rowidx, label, inival):
@@ -497,7 +571,7 @@ class PanoramaAlignmentGUI:
         tkvar.set(inival)
         # Set a callback for whenever tkvar is changed.
         # (The 'command' callback on the SpinBox only applies to the buttons.)
-        tkvar.trace('w', self.update_preview)
+        tkvar.trace('w', self._update_callback)
         # Create the Label, SpinBox, and Scale objects.
         label = tk.Label(parent, text=label)
         spbox = tk.Spinbox(parent,
@@ -512,6 +586,21 @@ class PanoramaAlignmentGUI:
         spbox.grid(row=rowidx, column=1)
         slide.grid(row=rowidx, column=2)
         return tkvar
+
+    # Thin wrapper for update_preview(), used to strip Tkinter arguments.
+    def _update_callback(self, *args):
+        # Sanity check that initialization is completed:
+        if not self.init_done: return
+        # Determine the render size.  (Always 2:1 aspect ratio.)
+        # TODO: Figure out how to remove the -2 fudge factor.
+        #       Without it, the size gets into an infinite update loop.
+        # TODO: Should we be using winfo_width() or winfo_reqwidth()
+        # TODO: Should we put the label inside a Frame and disable propagation?
+        psize = min(self.preview_lbl.winfo_width()/2,
+                    self.preview_lbl.winfo_height()) - 2
+        # Render the preview at the given size.
+        if psize >= 10:
+            self.update_preview(psize)
 
 
 # Tkinter GUI window for end-to-end alignment and rendering.
@@ -563,42 +652,44 @@ class PanoramaGUI:
         # Finish frame creation.
         frame.pack()
 
+    # Helper function to destroy an object.
+    def _destroy(self, obj):
+        if obj is not None:
+            obj.destroy()
+
     # Popup dialogs for each alignment step.
     def _adjust_lens1(self):
-        if self.win_align is not None:
-            self.win_lens1.destroy()
+        self._destroy(self.win_lens1)
         try:
             self.win_lens1 = tk.Toplevel(self.parent)
             FisheyeAlignmentGUI(self.win_lens1, self.img1.get(), self.lens1)
         except IOError:
-            self.win_lens1.destroy()
+            self._destroy(self.win_lens1)
             tkMessageBox.showerror('Error', 'Unable to read image file #1.')
         except:
-            self.win_lens1.destroy()
+            self._destroy(self.win_lens1)
             tkMessageBox.showerror('Dialog creation error', traceback.format_exc())
 
     def _adjust_lens2(self):
-        if self.win_align is not None:
-            self.win_lens2.destroy()
+        self._destroy(self.win_lens2)
         try:
             self.win_lens2 = tk.Toplevel(self.parent)
             FisheyeAlignmentGUI(self.win_lens2, self.img2.get(), self.lens2)
         except IOError:
-            self.win_lens1.destroy()
+            self._destroy(self.win_lens2)
             tkMessageBox.showerror('Error', 'Unable to read image file #2.')
         except:
-            self.win_lens2.destroy()
+            self._destroy(self.win_lens2)
             tkMessageBox.showerror('Dialog creation error', traceback.format_exc())
 
     def _adjust_align(self):
-        if self.win_align is not None:
-            self.win_align.destroy()
+        self._destroy(self.win_align)
         try:
             pan = self._create_panorama()
             self.win_align = tk.Toplevel(self.parent)
             PanoramaAlignmentGUI(self.win_align, pan)
         except:
-            self.win_align.destroy()
+            self._destroy(self.win_align)
             tkMessageBox.showerror('Dialog creation error', traceback.format_exc())
 
     # Create panorama object using current settings.
