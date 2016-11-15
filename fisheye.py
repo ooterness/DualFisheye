@@ -384,6 +384,8 @@ class PanoramaImage:
 # Tkinter GUI window for loading a fisheye image.
 class FisheyeAlignmentGUI:
     def __init__(self, parent, src_file, lens):
+        # Set flag once all window objects created.
+        self.init_done = False
         # Final result is the lens object.
         self.lens = lens
         # Load the input file.
@@ -401,38 +403,40 @@ class FisheyeAlignmentGUI:
                                    lens.radius_px, self.img.size[0])
         self.f = self._make_slider(self.controls, 3, 'Field of view (deg)',
                                    lens.fov_deg, 240)
-        # Create the preview frame.
-        pre_size = self._get_aspect_size((800,800))
-        self.preview = tk.Canvas(self.frame, width=pre_size[0], height=pre_size[1])
-        self.preview.bind('<Configure>', self.update_preview)  # Update on resize
+        # Create a frame for the preview image, which resizes based on the
+        # outer frame but does not respond to the contained preview size.
+        self.preview_frm = tk.Frame(self.frame)
+        self.preview_frm.bind('<Configure>', self._update_callback)  # Update on resize
+        # Create the canvas object for the preview image.
+        self.preview = tk.Canvas(self.preview_frm)
         # Finish frame creation.
         self.controls.pack(side=tk.LEFT)
-        self.preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=1)
-        self.frame.pack()
-        self.update_preview()
+        self.preview.pack(fill=tk.BOTH, expand=1)
+        self.preview_frm.pack(side=tk.LEFT, fill=tk.BOTH, expand=1)
+        self.frame.pack(fill=tk.BOTH, expand=1)
+        # Render the image once at default size
+        self.init_done = True
+        self.update_preview((800,800))
+        # Disable further size propagation.
+        self.preview_frm.update()
+        self.preview_frm.pack_propagate(0)
 
     # Redraw the preview image using latest GUI parameters.
-    def update_preview(self, *args):
+    def update_preview(self, psize):
         # Safety check: Ignore calls during construction/destruction.
-        if not hasattr(self, 'preview') or self.preview is None:
-            return
-        pre_size = (float(self.preview.winfo_width()),
-                    float(self.preview.winfo_height()))
-        if pre_size[0] < 10 or pre_size[1] < 10:
-            return
-        # Copy latest result to the lens object.
+        if not self.init_done: return
+        # Copy latest user settings to the lens object.
         self.lens.fov_deg = self.f.get()
         self.lens.radius_px = self.r.get()
         self.lens.center_px[0] = self.x.get()
         self.lens.center_px[1] = self.y.get()
         # Re-scale the image to match the canvas size.
         # Note: Make a copy first, because thumbnail() operates in-place.
-        pre_size = self._get_aspect_size(pre_size)
         self.img_sc = self.img.copy()
-        self.img_sc.thumbnail(pre_size, Image.NEAREST)
+        self.img_sc.thumbnail(psize, Image.NEAREST)
         self.img_tk = ImageTk.PhotoImage(self.img_sc)
         # Re-scale the x/y/r parameters to match the preview scale.
-        pre_scale = float(pre_size[0]) / float(self.img.size[0])
+        pre_scale = float(psize[0]) / float(self.img.size[0])
         x = self.x.get() * pre_scale
         y = self.y.get() * pre_scale
         r = self.r.get() * pre_scale
@@ -449,7 +453,7 @@ class FisheyeAlignmentGUI:
         tkvar.set(inival)
         # Set a callback for whenever tkvar is changed.
         # (The 'command' callback on the SpinBox only applies to the buttons.)
-        tkvar.trace('w', self.update_preview)
+        tkvar.trace('w', self._update_callback)
         # Create the Label, SpinBox, and Scale objects.
         label = tk.Label(parent, text=label)
         spbox = tk.Spinbox(parent,
@@ -472,6 +476,17 @@ class FisheyeAlignmentGUI:
         return (min(max_size[0], max_size[1] / img_ratio),
                 min(max_size[1], max_size[0] * img_ratio))
 
+    # Thin wrapper for update_preview(), used to strip Tkinter arguments.
+    def _update_callback(self, *args):
+        # Sanity check that initialization is completed:
+        if not self.init_done: return
+        # Determine the render size.  (Always 2:1 aspect ratio.)
+        psize = self._get_aspect_size((self.preview_frm.winfo_width(),
+                                       self.preview_frm.winfo_height()))
+        # Render the preview at the given size.
+        if psize[0] >= 10 and psize[1] >= 10:
+            self.update_preview(psize)
+
 
 # Tkinter GUI window for calibrating fisheye alignment.
 class PanoramaAlignmentGUI:
@@ -487,7 +502,7 @@ class PanoramaAlignmentGUI:
         tk.Label(self.controls, text='Preview mode').grid(row=0, column=0, sticky=tk.W)
         self.mode = tk.StringVar()
         self.mode.set('align')
-        self.mode.trace('w', self.update_preview)
+        self.mode.trace('w', self._update_callback)
         mode_list = self.panorama.get_render_modes()
         mode_drop = tk.OptionMenu(self.controls, self.mode, *mode_list)
         mode_drop.grid(row=0, column=1, columnspan=2, sticky='NESW')
@@ -497,7 +512,7 @@ class PanoramaAlignmentGUI:
         diff_qq  = mul_qq(front_qq, back_qq)
         # Create the axis selection toggle. (Flip on Y or Z)
         self.flip_axis = tk.BooleanVar()
-        self.flip_axis.trace('w', self.update_preview)
+        self.flip_axis.trace('w', self._update_callback)
         if abs(diff_qq[2]) > abs(diff_qq[3]):
             self.flip_axis.set(False)
             flip_qq = [0,0,1,0]
@@ -519,14 +534,22 @@ class PanoramaAlignmentGUI:
         self.slide_az = self._make_slider(self.controls, 7, 'Align Z', align_qq[3])
         # Finish control-frame creation.
         self.controls.pack(side=tk.LEFT)
+        # Create a frame for the preview image, which resizes based on the
+        # outer frame but does not respond to the contained preview size.
+        self.preview_frm = tk.Frame(self.frame)
+        self.preview_frm.bind('<Configure>', self._update_callback)  # Update on resize
         # Add the preview.
-        self.preview_lbl = tk.Label(self.frame)
-        self.init_done = True
-        self.update_preview(psize)
-        self.preview_lbl.pack(fill=tk.BOTH, expand=1)
+        self.preview_lbl = tk.Label(self.preview_frm)   # Label displays image
+        self.preview_lbl.pack()
+        self.preview_frm.pack(fill=tk.BOTH, expand=1)
         # Finish frame creation.
         self.frame.pack(fill=tk.BOTH, expand=1)
-        self.frame.bind('<Configure>', self._update_callback)  # Update on resize
+        # Render the image once at default size
+        self.init_done = True
+        self.update_preview(psize)
+        # Disable further size propagation.
+        self.preview_frm.update()
+        self.preview_frm.pack_propagate(0)
 
     # Update the GUI preview using latest alignment parameters.
     def update_preview(self, psize):
@@ -592,15 +615,13 @@ class PanoramaAlignmentGUI:
         # Sanity check that initialization is completed:
         if not self.init_done: return
         # Determine the render size.  (Always 2:1 aspect ratio.)
-        # TODO: Figure out how to remove the -2 fudge factor.
-        #       Without it, the size gets into an infinite update loop.
-        # TODO: Should we be using winfo_width() or winfo_reqwidth()
-        # TODO: Should we put the label inside a Frame and disable propagation?
-        psize = min(self.preview_lbl.winfo_width()/2,
-                    self.preview_lbl.winfo_height()) - 2
+        psize = min(self.preview_frm.winfo_width()/2,
+                    self.preview_frm.winfo_height())
         # Render the preview at the given size.
+        # TODO: Fudge factor of -2 avoids infinite resize loop.
+        #       Is there a better way?
         if psize >= 10:
-            self.update_preview(psize)
+            self.update_preview(psize-2)
 
 
 # Tkinter GUI window for end-to-end alignment and rendering.
