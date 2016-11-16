@@ -41,8 +41,11 @@ import tkFileDialog
 import tkMessageBox
 import sys
 import traceback
+from copy import deepcopy
 from math import pi
 from PIL import Image, ImageTk
+from scipy.optimize import minimize
+from threading import Thread
 
 # Create rotation matrix from an arbitrary quaternion.  See also:
 # https://en.wikipedia.org/wiki/Quaternions_and_spatial_rotation#Conversion_to_and_from_the_matrix_representation
@@ -149,26 +152,32 @@ class FisheyeImage:
     # Load image file and set default parameters
     def __init__(self, src_file, lens=None):
         # Load the image file, and convert to a numpy matrix.
-        self.img = np.array(Image.open(src_file))
-        self.rows = self.img.shape[0]
-        self.cols = self.img.shape[1]
-        self.clrs = self.img.shape[2]
+        self._update_img(Image.open(src_file))
         # Set lens parameters.
         if lens is None:
             self.lens = FisheyeLens(self.rows, self.cols)
         else:
             self.lens = lens
 
+    # Update image matrix and corresponding size variables.
+    def _update_img(self, img):
+        self.img = np.array(img)
+        self.rows = self.img.shape[0]
+        self.cols = self.img.shape[1]
+        self.clrs = self.img.shape[2]
+
     # Shrink source image and adjust lens accordingly.
     def downsample(self, dsamp):
         # Adjust lens parameters.
         self.lens.downsample(dsamp)
         # Determine the new image dimensions.
-        shape = self.img.shape[0:2] / dsamp
-        # Convert matrix back to PIL Image, resample, and convert back.
+        shape = (self.img.shape[0] / dsamp,
+                 self.img.shape[1] / dsamp)
+        # Convert matrix back to PIL Image and resample.
         img = Image.fromarray(self.img)
-        img.thumbnail(shape, Image.LANCZOS)
-        self.img = np.array(img)
+        img.thumbnail(shape, Image.BICUBIC)
+        # Convert back and update size.
+        self._update_img(img)
 
     # Given an 3xN array of "XYZ" vectors in panorama space (+X = Front),
     # convert each ray to 2xN coordinates in "UV" fisheye image space.
@@ -257,17 +266,33 @@ class PanoramaImage:
     def get_render_modes(self):
         return ['overwrite', 'align', 'blend']
 
+    # Retrieve a scaled copy of lens parameters for the Nth source.
+    def scale_lens(self, idx, scale=None):
+        temp = deepcopy(self.sources[idx].lens)
+        temp.downsample(1.0 / scale)
+        return temp
+
     # Using current settings as an initial guess, use an iterative optimizer
     # to better align the source images.  Adjusts FOV of each lens, as well
     # as the rotation quaternions for all lenses except the first.
     # TODO: Implement a higher-order loop that iterates this step with
     #       progressively higher resolution.  (See also: create_panorama)
-    def optimize(self, wt_overlap):
-        # Precalculate raster-order XYZ coordinates.
-        [xyz, rows, cols] = self._get_equirectangular_raster(256)
+    # TODO: Find a better scoring heuristic.  Present solution always
+    #       converges on either FOV=0 or FOV=9999, depending on wt_overlap.
+    def optimize(self, psize=256, wt_overlap=1000):
+        # Precalculate raster-order XYZ coordinates at given resolution.
+        [xyz, rows, cols] = self._get_equirectangular_raster(psize)
+        # Scoring function gives bonus points per overlapping pixel.
+        score = lambda svec: self._score(svec, xyz, wt_overlap)
         # Multivariable optimization using gradient-descent or similar.
         # https://docs.scipy.org/doc/scipy/reference/tutorial/optimize.html
-        # TODO: Implement this!
+        svec0 = self._get_state_vector()
+#        final = minimize(score, svec0, method='Nelder-Mead',
+#                         options={'xtol':1e-3, 'maxfev':256, 'disp':True})
+        final = minimize(score, svec0, method='Nelder-Mead',
+                         options={'xtol':1e-4, 'disp':True})
+        # Store final lens parameters.
+        self._set_state_vector(final.x)
 
     # Render combined panorama in equirectangular projection mode.
     # See also: https://en.wikipedia.org/wiki/Equirectangular_projection
@@ -320,6 +345,35 @@ class PanoramaImage:
         xyz = np.matrix([x.ravel(), y.ravel(), z.ravel()])
         return [xyz, rows, cols]
 
+    # Convert all lens parameters to a state vector. See also: optimize()
+    def _get_state_vector(self):
+        nsrc = len(self.sources)
+        assert nsrc > 0
+        svec = np.zeros(4*nsrc - 3)
+        # First lens: Only the FOV is stored.
+        svec[0] = self.sources[0].lens.fov_deg / 180
+        # All other lenses: Store FOV and quaternion parameters.
+        for n in range(1, nsrc):
+            svec[4*n-3] = self.sources[n].lens.fov_deg / 180
+            svec[4*n-2] = self.sources[n].lens.center_qq[1]
+            svec[4*n-1] = self.sources[n].lens.center_qq[2]
+            svec[4*n-0] = self.sources[n].lens.center_qq[3]
+        return svec
+
+    # Update lens parameters based on state vector.  See also: optimize()
+    def _set_state_vector(self, svec):
+        # Sanity check on input vector.
+        nsrc = len(self.sources)
+        assert len(svec) == (4*nsrc - 3)
+        # First lens: Only the FOV is changed.
+        self.sources[0].lens.fov_deg = 180 * svec[0]
+        # All other lenses: Update FOV and quaternion parameters.
+        for n in range(1, nsrc):
+            self.sources[n].lens.fov_deg = 180 * svec[4*n-3]
+            self.sources[n].lens.center_qq[1] = svec[4*n-2]
+            self.sources[n].lens.center_qq[2] = svec[4*n-1]
+            self.sources[n].lens.center_qq[3] = svec[4*n-0]
+
     # Add pixels from every source to form a complete output image.
     # Several blending modes are available. See also: get_render_modes()
     def _render(self, xyz, rows, cols, mode):
@@ -359,8 +413,10 @@ class PanoramaImage:
         return np.asarray(img2d, dtype=self.dtype)
 
     # Compute a normalized alignment score, based on size of overlap and
-    # the pixel-differences in that region.
-    def _score(self, xyz, wt_overlap):
+    # the pixel-differences in that region.  Note: Lower = Better.
+    def _score(self, svec, xyz, wt_overlap):
+        # Update lens parameters from state vector.
+        self._set_state_vector(svec)
         # Determine masks for each input image.
         uv0 = self.sources[0].get_uv(xyz)
         uv1 = self.sources[1].get_uv(xyz)
@@ -378,7 +434,7 @@ class PanoramaImage:
         # Sum-of-square differences.
         sum_sqd = np.sum(np.sum(np.sum(np.square(img1d))))
         # Compute overall score.  (Note: Higher = Better)
-        return wt_overlap * ct_overlap - sum_sqd
+        return sum_sqd - wt_overlap * ct_overlap
 
 
 # Tkinter GUI window for loading a fisheye image.
@@ -632,6 +688,8 @@ class PanoramaGUI:
         self.win_lens1 = None
         self.win_lens2 = None
         self.win_align = None
+        self.work_done = False
+        self.work_error = None
         # Create dummy lens configuration.
         self.lens1 = FisheyeLens()
         self.lens2 = FisheyeLens()
@@ -649,13 +707,15 @@ class PanoramaGUI:
         btn_lens1 = tk.Button(lens_frame, text='Lens 1', command=self._adjust_lens1)
         btn_lens2 = tk.Button(lens_frame, text='Lens 2', command=self._adjust_lens2)
         btn_align = tk.Button(lens_frame, text='Align', command=self._adjust_align)
+        btn_auto = tk.Button(lens_frame, text='Auto', command=self._auto_align_start)
         btn_load = tk.Button(lens_frame, text='Load', command=self._load_config)
         btn_save = tk.Button(lens_frame, text='Save', command=self._save_config)
         btn_lens1.grid(row=0, column=0, sticky='NESW')
         btn_lens2.grid(row=0, column=1, sticky='NESW')
         btn_align.grid(row=0, column=2, sticky='NESW')
+        btn_auto.grid(row=0, column=3, sticky='NESW')
         btn_load.grid(row=1, column=0, columnspan=2, sticky='NESW')
-        btn_save.grid(row=1, column=2, sticky='NESW')
+        btn_save.grid(row=1, column=2, columnspan=2, sticky='NESW')
         lens_frame.pack(fill=tk.BOTH)
         # Buttons to render the final output in different modes.
         out_frame = tk.LabelFrame(frame, text='Final output rendering')
@@ -712,6 +772,56 @@ class PanoramaGUI:
         except:
             self._destroy(self.win_align)
             tkMessageBox.showerror('Dialog creation error', traceback.format_exc())
+
+    # Automatic alignment.
+    # Use worker thread, because this may take a while.
+    def _auto_align_start(self):
+        try:
+            # Create panorama object from within GUI thread, since it depends
+            # on Tk variables which are NOT thread-safe.
+            pan = self._create_panorama()
+            # Display status message and display hourglass...
+            self._set_status('Starting auto-alignment...', 'wait')
+            # Create a new worker thread.
+            work = Thread(target=self._auto_align_work, args=[pan])
+            work.start()
+            # Set a timer to periodically check for completion.
+            self.parent.after(200, self._auto_align_timer)
+        except:
+            tkMessageBox.showerror('Auto-alignment error', traceback.format_exc())
+
+    def _auto_align_work(self, pan):
+        try:
+            # Create a panorama object at 1/4 original resolution.
+            pan.downsample(4)
+            # Coarse optimization uses coarse render resolution.
+            pan.optimize(128)
+            # Update local lens parameters.
+            # Note: These are not Tk variables, so are safe to change.
+            self.lens1 = pan.scale_lens(0, 4)
+            self.lens2 = pan.scale_lens(1, 4)
+            # Signal success!
+            self.work_error = None
+            self.work_done = True
+        except:
+            # Signal error.
+            self.work_error = traceback.format_exc()
+            self.work_done = True
+
+    # Timer callback object checks outputs from worker thread.
+    # (Tkinter objects are NOT thread safe.)
+    def _auto_align_timer(self, *args):
+        # Check thread status.
+        if self.work_done:
+            if self.work_error is None:
+                self._set_status('Auto-alignment completed.')
+            else:
+                self._set_status('Auto-alignment failed.')
+                tkMessageBox.showerror('Auto-alignment error', self.work_error)
+            self.work_done = False
+        else:
+            # Reset timer to be called again.
+            self.parent.after(200, self._auto_align_timer)
 
     # Create panorama object using current settings.
     def _create_panorama(self):
