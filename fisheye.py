@@ -959,7 +959,6 @@ if __name__ == "__main__":
         print '  python fisheye.py lens.cfg in1.jpg in2.jpg cube=out.png'
         print '    Render and save cubemap panorama using specified'
         print '    lens configuration and source images.'
-        sys.exit(2)
     else:
         # Otherwise, start the interactive GUI with all fields blank.
         launch_tk_gui()
