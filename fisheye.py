@@ -699,6 +699,7 @@ class PanoramaGUI:
         self.win_align = None
         self.work_done = False
         self.work_error = None
+        self.work_status = None
         # Create dummy lens configuration.
         self.lens1 = FisheyeLens()
         self.lens2 = FisheyeLens()
@@ -788,47 +789,64 @@ class PanoramaGUI:
         try:
             # Create panorama object from within GUI thread, since it depends
             # on Tk variables which are NOT thread-safe.
-            pan = deepcopy(self._create_panorama())
+            pan = self._create_panorama()
             # Display status message and display hourglass...
             self._set_status('Starting auto-alignment...', 'wait')
             # Create a new worker thread.
-            work = Thread(target=self._auto_align_work, args=[pan, 4, 256])
+            work = Thread(target=self._auto_align_work, args=[pan])
             work.start()
             # Set a timer to periodically check for completion.
             self.parent.after(200, self._auto_align_timer)
         except:
             tkMessageBox.showerror('Auto-alignment error', traceback.format_exc())
 
-    def _auto_align_work(self, pan, scale, psize):
+    def _auto_align_work(self, pan):
         try:
-            # Create a panorama object at 1/4 original resolution.
-            pan.downsample(scale)
-            # Coarse optimization uses coarse render resolution.
-            pan.optimize(psize)
-            # Update local lens parameters.
-            # Note: These are not Tk variables, so are safe to change.
-            self.lens1 = pan.scale_lens(0, scale)
-            self.lens2 = pan.scale_lens(1, scale)
+            # Repeat alignment at progressively higher resolution.
+            self._auto_align_step(pan, 16, 128, 'Stage 1/4')
+            self._auto_align_step(pan,  8, 128, 'Stage 2/4')
+            self._auto_align_step(pan,  4, 192, 'Stage 3/4')
+            self._auto_align_step(pan,  2, 256, 'Stage 4/4')
             # Signal success!
+            self.work_status = 'Auto-alignment completed.'
             self.work_error = None
             self.work_done = True
         except:
             # Signal error.
+            self.work_status = 'Auto-alignment failed.'
             self.work_error = traceback.format_exc()
             self.work_done = True
+                
+    def _auto_align_step(self, pan, scale, psize, label):
+        # Update status message.
+        self.work_status = 'Auto-alignment: ' + str(label)
+        # Create a panorama object at 1/scale times original resolution.
+        pan_sc = deepcopy(pan)
+        pan_sc.downsample(scale)
+        # Run optimization, rendering each hypothesis at the given resolution.
+        pan_sc.optimize(psize)
+        # Update local lens parameters.
+        # Note: These are not Tk variables, so are safe to change.
+        self.lens1 = pan_sc.scale_lens(0, scale)
+        self.lens2 = pan_sc.scale_lens(1, scale)
 
     # Timer callback object checks outputs from worker thread.
     # (Tkinter objects are NOT thread safe.)
     def _auto_align_timer(self, *args):
         # Check thread status.
         if self.work_done:
-            if self.work_error is None:
-                self._set_status('Auto-alignment completed.')
-            else:
+            # Update status message, with popup on error.
+            if self.work_status is not None:
+                self._set_status(self.work_status)
+            if self.work_error is not None:
                 self._set_status('Auto-alignment failed.')
                 tkMessageBox.showerror('Auto-alignment error', self.work_error)
+            # Clear the 'done' flag for future runs.
             self.work_done = False
         else:
+            # Update status message and keep hourglass.
+            if self.work_status is not None:
+                self._set_status(self.work_status, 'wait')
             # Reset timer to be called again.
             self.parent.after(200, self._auto_align_timer)
 
