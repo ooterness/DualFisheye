@@ -173,8 +173,9 @@ class FisheyeImage:
         # Adjust lens parameters.
         self.lens.downsample(dsamp)
         # Determine the new image dimensions.
-        shape = (self.img.shape[0] / dsamp,
-                 self.img.shape[1] / dsamp)
+        # Note: PIL uses cols, rows whereas numpy uses rows, cols
+        shape = (self.img.shape[1] / dsamp,     # Cols
+                 self.img.shape[0] / dsamp)     # Rows
         # Convert matrix back to PIL Image and resample.
         img = Image.fromarray(self.img)
         img.thumbnail(shape, Image.BICUBIC)
@@ -218,8 +219,9 @@ class FisheyeImage:
     # Given an 2xN array of UV pixel coordinates, return a weight score
     # that is proportional to the distance from the edge.
     def get_weight(self, uv_px):
+        mm = self.get_mask(uv_px)
         rr = self.lens.radius_px - matrix_len(uv_px - self.lens.center_px)
-        rr[rr < 0] = 0
+        rr[~mm] = 0
         return rr
 
     # Given a 2xN array of UV pixel coordinates, return the value of each
@@ -247,7 +249,8 @@ class FisheyeImage:
         elif np.isscalar(weight):
             img1d[mask] += self.img[yy,xx] * weight
         else:
-            w3 = np.asmatrix(weight).transpose() * np.ones((1,3))
+            w1 = np.asmatrix(weight, dtype='float32')
+            w3 = w1.transpose() * np.ones((1,3))
             img1d[mask] += np.multiply(self.img[yy,xx], w3[mask])
 
 
@@ -255,6 +258,7 @@ class FisheyeImage:
 # TODO: Add support for supersampled anti-aliasing filters.
 class PanoramaImage:
     def __init__(self, src_list):
+        self.debug = True
         self.sources = src_list
         self.dtype = self.sources[0].img.dtype
         self.clrs = self.sources[0].clrs
@@ -280,17 +284,15 @@ class PanoramaImage:
     # TODO: Implement a higher-order loop that iterates this step with
     #       progressively higher resolution.  (See also: create_panorama)
     # TODO: Find a better scoring heuristic.  Present solution always
-    #       converges on either FOV=0 or FOV=9999, depending on wt_overlap.
-    def optimize(self, psize=256, wt_overlap=1000):
+    #       converges on either FOV=0 or FOV=9999, depending on wt_pixel.
+    def optimize(self, psize=256, wt_pixel=1000, wt_blank=1000):
         # Precalculate raster-order XYZ coordinates at given resolution.
         [xyz, rows, cols] = self._get_equirectangular_raster(psize)
         # Scoring function gives bonus points per overlapping pixel.
-        score = lambda svec: self._score(svec, xyz, wt_overlap)
+        score = lambda svec: self._score(svec, xyz, wt_pixel, wt_blank)
         # Multivariable optimization using gradient-descent or similar.
         # https://docs.scipy.org/doc/scipy/reference/tutorial/optimize.html
         svec0 = self._get_state_vector()
-#        final = minimize(score, svec0, method='Nelder-Mead',
-#                         options={'xtol':1e-3, 'maxfev':256, 'disp':True})
         final = minimize(score, svec0, method='Nelder-Mead',
                          options={'xtol':1e-4, 'disp':True})
         # Store final lens parameters.
@@ -353,10 +355,10 @@ class PanoramaImage:
         assert nsrc > 0
         svec = np.zeros(4*nsrc - 3)
         # First lens: Only the FOV is stored.
-        svec[0] = self.sources[0].lens.fov_deg / 180
+        svec[0] = self.sources[0].lens.fov_deg - 180
         # All other lenses: Store FOV and quaternion parameters.
         for n in range(1, nsrc):
-            svec[4*n-3] = self.sources[n].lens.fov_deg / 180
+            svec[4*n-3] = self.sources[n].lens.fov_deg - 180
             svec[4*n-2] = self.sources[n].lens.center_qq[1]
             svec[4*n-1] = self.sources[n].lens.center_qq[2]
             svec[4*n-0] = self.sources[n].lens.center_qq[3]
@@ -368,10 +370,10 @@ class PanoramaImage:
         nsrc = len(self.sources)
         assert len(svec) == (4*nsrc - 3)
         # First lens: Only the FOV is changed.
-        self.sources[0].lens.fov_deg = 180 * svec[0]
+        self.sources[0].lens.fov_deg = svec[0] + 180
         # All other lenses: Update FOV and quaternion parameters.
         for n in range(1, nsrc):
-            self.sources[n].lens.fov_deg = 180 * svec[4*n-3]
+            self.sources[n].lens.fov_deg = svec[4*n-3] + 180
             self.sources[n].lens.center_qq[1] = svec[4*n-2]
             self.sources[n].lens.center_qq[2] = svec[4*n-1]
             self.sources[n].lens.center_qq[3] = svec[4*n-0]
@@ -416,27 +418,32 @@ class PanoramaImage:
 
     # Compute a normalized alignment score, based on size of overlap and
     # the pixel-differences in that region.  Note: Lower = Better.
-    def _score(self, svec, xyz, wt_overlap):
+    def _score(self, svec, xyz, wt_pixel, wt_blank):
         # Update lens parameters from state vector.
         self._set_state_vector(svec)
         # Determine masks for each input image.
         uv0 = self.sources[0].get_uv(xyz)
         uv1 = self.sources[1].get_uv(xyz)
-        wt0 = self.sources[0].get_weight(uv0)
-        wt1 = self.sources[1].get_weight(uv1)
+        wt0 = self.sources[0].get_weight(uv0) > 0
+        wt1 = self.sources[1].get_weight(uv1) > 0
         # Count overlapping pixels.
-        ovr_mask = np.logical_and(wt0 > 0, wt1 > 0)
-        ct_overlap = np.sum(ovr_mask)
+        ovr_mask = np.logical_and(wt0, wt1)             # Overlapping pixel
+        pix_count = np.sum(wt0) + np.sum(wt1)           # Total drawn pixels
+        blk_count = np.sum(np.logical_and(~wt0, ~wt1))  # Number of blank pixels
         # Allocate Nx3 or Nx1 "1D" pixel-list (raster-order).
         pcount = max(xyz.shape)
         img1d = np.zeros((pcount, self.clrs), dtype='float32')
         # Render the difference image, overlapping region only.
-        self.sources[0].add_pixels(uv0, img1d, ovr_mask)
-        self.sources[1].add_pixels(uv1, img1d, -ovr_mask)
-        # Sum-of-square differences.
+        self.sources[0].add_pixels(uv0, img1d, 1.0*ovr_mask)
+        self.sources[1].add_pixels(uv1, img1d, -1.0*ovr_mask)
+        # Sum-of-differences.
         sum_sqd = np.sum(np.sum(np.sum(np.square(img1d))))
         # Compute overall score.  (Note: Higher = Better)
-        return sum_sqd - wt_overlap * ct_overlap
+        score = sum_sqd + wt_blank * blk_count - wt_pixel * pix_count
+        # (Debug) Print status information.
+        if (self.debug):
+            print str(svec) + ' --> ' + str(score)
+        return score
 
 
 # Tkinter GUI window for loading a fisheye image.
@@ -460,7 +467,7 @@ class FisheyeAlignmentGUI:
         self.r = self._make_slider(self.controls, 2, 'Radius (px)',
                                    lens.radius_px, self.img.size[0])
         self.f = self._make_slider(self.controls, 3, 'Field of view (deg)',
-                                   lens.fov_deg, 240)
+                                   lens.fov_deg, 240, res=0.1)
         # Create a frame for the preview image, which resizes based on the
         # outer frame but does not respond to the contained preview size.
         self.preview_frm = tk.Frame(self.frame)
@@ -505,7 +512,7 @@ class FisheyeAlignmentGUI:
                                  outline='#C00000', width=3)
 
     # Make a combined label/textbox/slider for a given variable:
-    def _make_slider(self, parent, rowidx, label, inival, maxval):
+    def _make_slider(self, parent, rowidx, label, inival, maxval, res=0.5):
         # Create shared variable and set initial value.
         tkvar = tk.DoubleVar()
         tkvar.set(inival)
@@ -516,12 +523,12 @@ class FisheyeAlignmentGUI:
         label = tk.Label(parent, text=label)
         spbox = tk.Spinbox(parent,
             textvariable=tkvar,
-            from_=0, to=maxval)
+            from_=0, to=maxval, increment=res)
         slide = tk.Scale(parent,
             orient=tk.HORIZONTAL,
             showvalue=0,
             variable=tkvar,
-            from_=0, to=maxval, resolution=0.2)
+            from_=0, to=maxval, resolution=res)
         label.grid(row=rowidx, column=0)
         spbox.grid(row=rowidx, column=1)
         slide.grid(row=rowidx, column=2)
@@ -781,27 +788,27 @@ class PanoramaGUI:
         try:
             # Create panorama object from within GUI thread, since it depends
             # on Tk variables which are NOT thread-safe.
-            pan = self._create_panorama()
+            pan = deepcopy(self._create_panorama())
             # Display status message and display hourglass...
             self._set_status('Starting auto-alignment...', 'wait')
             # Create a new worker thread.
-            work = Thread(target=self._auto_align_work, args=[pan])
+            work = Thread(target=self._auto_align_work, args=[pan, 4, 256])
             work.start()
             # Set a timer to periodically check for completion.
             self.parent.after(200, self._auto_align_timer)
         except:
             tkMessageBox.showerror('Auto-alignment error', traceback.format_exc())
 
-    def _auto_align_work(self, pan):
+    def _auto_align_work(self, pan, scale, psize):
         try:
             # Create a panorama object at 1/4 original resolution.
-            pan.downsample(4)
+            pan.downsample(scale)
             # Coarse optimization uses coarse render resolution.
-            pan.optimize(128)
+            pan.optimize(psize)
             # Update local lens parameters.
             # Note: These are not Tk variables, so are safe to change.
-            self.lens1 = pan.scale_lens(0, 4)
-            self.lens2 = pan.scale_lens(1, 4)
+            self.lens1 = pan.scale_lens(0, scale)
+            self.lens2 = pan.scale_lens(1, scale)
             # Signal success!
             self.work_error = None
             self.work_done = True
